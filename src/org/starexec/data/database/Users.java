@@ -8,6 +8,8 @@ import org.starexec.data.to.DefaultSettings.SettingType;
 import org.starexec.data.to.Job;
 import org.starexec.data.to.Space;
 import org.starexec.data.to.User;
+import org.starexec.data.to.Benchmark;
+import org.starexec.data.to.Solver;
 import org.starexec.exceptions.StarExecSecurityException;
 import org.starexec.logger.StarLogger;
 import org.starexec.util.*;
@@ -19,12 +21,32 @@ import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Handles all database interaction for users
  */
 public class Users {
 	private static final StarLogger log = StarLogger.getLogger(Users.class);
+	
+	// Cache for isAdmin results to reduce database calls
+	private static final ConcurrentHashMap<Integer, CacheEntry<Boolean>> isAdminCache = new ConcurrentHashMap<>();
+	private static final long CACHE_DURATION_MS = TimeUnit.MINUTES.toMillis(5); // Cache for 5 minutes
+
+	private static class CacheEntry<T> {
+		final T value;
+		final long timestamp;
+
+		CacheEntry(T value) {
+			this.value = value;
+			this.timestamp = System.currentTimeMillis();
+		}
+
+		boolean isExpired(long duration) {
+			return (System.currentTimeMillis() - timestamp) > duration;
+		}
+	}
 
 	/**
 	 * Associates a user with a space (i.e. adds the user to the space)
@@ -1128,23 +1150,36 @@ public class Users {
 		Connection con = null;
 		CallableStatement procedure = null;
 		try {
+			// Step 1: Delete personal space first to clean up permissions
+			// This must succeed before we delete the user to avoid orphan permissions
+			Space personalSpace = Spaces.getPersonalSpace(userToDeleteId);
+			if (personalSpace != null) {
+				log.info("Deleting personal space for user " + userToDeleteId + " with space id " + personalSpace.getId());
+				if (!Spaces.removeSubspace(personalSpace.getId())) {
+					log.error("Failed to delete personal space for user " + userToDeleteId + " - aborting user deletion to avoid orphan permissions");
+					return false;
+				}
+			} else {
+				log.debug("No personal space found for user " + userToDeleteId);
+			}
 
-			// Delete the users primitive directories. This must occur before we delete the user
-			// so we can still get the users job id's from the database.
-			deleteUsersPrimitiveDirectories(userToDeleteId);
-
-
-			// Delete the user from the database, this should delete all benchmarks and solvers and jobs
-			// from the database using cascading deletes.
+			// Step 2: Delete user from database (cascades to related tables)
 			con = Common.getConnection();
 			procedure = con.prepareCall("{CALL DeleteUser(?)}");
 			procedure.setInt(1, userToDeleteId);
 			procedure.executeQuery();
+			
+			// Invalidate cache after deletion
+			invalidateIsAdminCache(userToDeleteId);
+
+			// Step 3: Only delete filesystem after successful database deletion
+			// This ensures we don't leave orphan directories if DB deletion fails
+			deleteUsersPrimitiveDirectories(userToDeleteId);
 
 			log.debug("Successfully deleted user with id=" + userToDeleteId);
 			return true;
 		} catch (Exception e) {
-			log.error("deleteUse", e);
+			log.error("deleteUser", e);
 		} finally {
 			Common.safeClose(con);
 			Common.safeClose(procedure);
@@ -1154,30 +1189,50 @@ public class Users {
 	}
 
 	/**
-	 * Deletes a user's benchmark and solver directory in the data directory.
+	 * Deletes ALL user-related data from the filesystem.
+	 * This includes: solvers, benchmarks, jobs, and ALL pictures (user, solver, and benchmark).
 	 *
-	 * @param userId Id of user whose benchmark and solver directories are to be deleted.
-	 * @author Albert Giegerich
+	 * @param userId Id of user whose data is to be completely deleted.
+	 * @author Albert Giegerich, Andres Caicedo (comprehensive cleanup)
 	 */
 	private static void deleteUsersPrimitiveDirectories(int userId) {
 		log.debug("Deleting primitive directories of user with id=" + userId);
 		deleteUsersSolverDirectory(userId);
 		deleteUsersBenchmarkDirectory(userId);
 		deleteUsersJobDirectories(userId);
+		deleteUserPictures(userId);
+		
+		// Get solvers and benchmarks to delete their pictures
+		List<Solver> solvers = Solvers.getByUser(userId);
+		if (solvers == null) {
+			solvers = new ArrayList<>();
+		}
+		List<Benchmark> benchmarks = Benchmarks.getByUser(userId);
+		if (benchmarks == null) {
+			benchmarks = new ArrayList<>();
+		}
+		
+		deleteUsersSolverPictures(userId, solvers);
+		deleteUsersBenchmarkPictures(userId, benchmarks);
 	}
 
 	/**
-	 * Deletes the given jobs' directories.
+	 * Deletes the given user's job output directories.
 	 *
+	 * @param userId Id of user whose job directories are to be deleted.
 	 * @author Albert Giegerich
 	 */
 	private static void deleteUsersJobDirectories(int userId) {
 		final String method = "deleteUsersJobDirectories";
 		log.entry(method);
 		List<Job> jobs = Jobs.getByUserId(userId);
+		if (jobs == null) {
+			log.debug(method + ": No jobs found for user " + userId);
+			return;
+		}
 		for (Job job : jobs) {
 			final String jobDirectory = Jobs.getDirectory(job.getId());
-			log.debug(method, "User is being deleted, deleting job directory with path: " + jobDirectory);
+			log.debug(method + ": User is being deleted, deleting job directory with path: " + jobDirectory);
 			Util.safeDeleteDirectory(jobDirectory);
 		}
 	}
@@ -1205,19 +1260,217 @@ public class Users {
 	}
 
 	/**
-	 * Checks to see whether the given user is an admin
+	 * Deletes a user's profile pictures (original and thumbnail) from the pictures directory.
+	 * User pictures are stored as:
+	 * - Original: /app/data/pictures/users/Pic{userId}_org.jpg
+	 * - Thumbnail: /app/data/pictures/users/Pic{userId}_thn.jpg
+	 *
+	 * @param userId Id of user whose pictures are to be deleted.
+	 * @author Andres Caicedo (Storage Leak Fix)
+	 */
+	private static void deleteUserPictures(int userId) {
+		final String method = "deleteUserPictures";
+		log.debug(method + ": Deleting pictures for user with id=" + userId);
+
+		String picturePath = R.getPicturePath();
+		long totalFreedSpace = 0;
+
+		// Delete original picture
+		String originalPicture = picturePath + java.io.File.separator + "users" + 
+								java.io.File.separator + "Pic" + userId + "_org.jpg";
+		java.io.File originalFile = new java.io.File(originalPicture);
+		if (originalFile.exists()) {
+			long originalSize = originalFile.length();
+			if (originalFile.delete()) {
+				totalFreedSpace += originalSize;
+				log.info(method + ": Deleted original picture: " + originalPicture + 
+						" (" + FileUtils.byteCountToDisplaySize(originalSize) + ")");
+			} else {
+				log.warn(method + ": Failed to delete original picture: " + originalPicture);
+			}
+		} else {
+			log.debug(method + ": No original picture found at: " + originalPicture);
+		}
+
+		// Delete thumbnail picture
+		String thumbnailPicture = picturePath + java.io.File.separator + "users" + 
+								 java.io.File.separator + "Pic" + userId + "_thn.jpg";
+		java.io.File thumbnailFile = new java.io.File(thumbnailPicture);
+		if (thumbnailFile.exists()) {
+			long thumbnailSize = thumbnailFile.length();
+			if (thumbnailFile.delete()) {
+				totalFreedSpace += thumbnailSize;
+				log.info(method + ": Deleted thumbnail picture: " + thumbnailPicture + 
+						" (" + FileUtils.byteCountToDisplaySize(thumbnailSize) + ")");
+			} else {
+				log.warn(method + ": Failed to delete thumbnail picture: " + thumbnailPicture);
+			}
+		} else {
+			log.debug(method + ": No thumbnail picture found at: " + thumbnailPicture);
+		}
+
+		if (totalFreedSpace > 0) {
+			log.info(method + ": Total space freed from user pictures: " + 
+					FileUtils.byteCountToDisplaySize(totalFreedSpace));
+		}
+	}
+
+	/**
+	 * Deletes profile pictures (original and thumbnail) for all solvers owned by the user.
+	 * Solver pictures are stored as:
+	 * - Original: /app/data/pictures/solvers/Pic{solverId}_org.jpg
+	 * - Thumbnail: /app/data/pictures/solvers/Pic{solverId}_thn.jpg
+	 *
+	 * @param userId Id of user whose solver pictures are to be deleted.
+	 * @param solvers Preloaded solvers owned by the user.
+	 * @author Andres Caicedo (Storage Leak Fix)
+	 */
+	private static void deleteUsersSolverPictures(int userId, List<Solver> solvers) {
+		final String method = "deleteUsersSolverPictures";
+		long totalFreed = 0;
+
+		if (solvers == null || solvers.isEmpty()) {
+			log.debug(method + ": No solvers found for user " + userId);
+			return;
+		}
+
+		try {
+			String picturePath = R.getPicturePath() + java.io.File.separator + "solvers";
+
+			for (Solver solver : solvers) {
+				java.io.File orgFile =
+						new java.io.File(picturePath + java.io.File.separator + "Pic" + solver.getId() + "_org.jpg");
+				if (orgFile.exists()) {
+					long size = orgFile.length();
+					if (orgFile.delete()) {
+						totalFreed += size;
+						log.debug(method + ": Deleted solver picture: " + orgFile.getPath());
+					}
+				}
+
+				java.io.File thnFile =
+						new java.io.File(picturePath + java.io.File.separator + "Pic" + solver.getId() + "_thn.jpg");
+				if (thnFile.exists()) {
+					long size = thnFile.length();
+					if (thnFile.delete()) {
+						totalFreed += size;
+						log.debug(method + ": Deleted solver thumbnail: " + thnFile.getPath());
+					}
+				}
+			}
+
+			if (totalFreed > 0) {
+				log.info(method + ": Freed " + FileUtils.byteCountToDisplaySize(totalFreed) +
+						" from solver pictures for user " + userId);
+			}
+		} catch (Exception e) {
+			log.error(method + ": Error deleting solver pictures for user " + userId, e);
+		}
+	}
+
+	/**
+	 * Deletes profile pictures (original and thumbnail) for all benchmarks owned by the user.
+	 * Benchmark pictures are stored as:
+	 * - Original: /app/data/pictures/benchmarks/Pic{benchmarkId}_org.jpg
+	 * - Thumbnail: /app/data/pictures/benchmarks/Pic{benchmarkId}_thn.jpg
+	 *
+	 * @param userId Id of user whose benchmark pictures are to be deleted.
+	 * @param benchmarks Preloaded benchmarks owned by the user.
+	 * @author Andres Caicedo (Storage Leak Fix)
+	 */
+	private static void deleteUsersBenchmarkPictures(int userId, List<Benchmark> benchmarks) {
+		final String method = "deleteUsersBenchmarkPictures";
+		long totalFreed = 0;
+
+		if (benchmarks == null || benchmarks.isEmpty()) {
+			log.debug(method + ": No benchmarks found for user " + userId);
+			return;
+		}
+
+		try {
+			String picturePath = R.getPicturePath() + java.io.File.separator + "benchmarks";
+
+			for (Benchmark benchmark : benchmarks) {
+				java.io.File orgFile =
+						new java.io.File(picturePath + java.io.File.separator + "Pic" + benchmark.getId() + "_org.jpg");
+				if (orgFile.exists()) {
+					long size = orgFile.length();
+					if (orgFile.delete()) {
+						totalFreed += size;
+						log.debug(method + ": Deleted benchmark picture: " + orgFile.getPath());
+					}
+				}
+
+				java.io.File thnFile =
+						new java.io.File(picturePath + java.io.File.separator + "Pic" + benchmark.getId() + "_thn.jpg");
+				if (thnFile.exists()) {
+					long size = thnFile.length();
+					if (thnFile.delete()) {
+						totalFreed += size;
+						log.debug(method + ": Deleted benchmark thumbnail: " + thnFile.getPath());
+					}
+				}
+			}
+
+			if (totalFreed > 0) {
+				log.info(method + ": Freed " + FileUtils.byteCountToDisplaySize(totalFreed) +
+						" from benchmark pictures for user " + userId);
+			}
+		} catch (Exception e) {
+			log.error(method + ": Error deleting benchmark pictures for user " + userId, e);
+		}
+	}
+
+	/**
+	 * Checks to see whether the given user is an admin (cached version)
 	 *
 	 * @param userId
 	 * @return True if the user is an admin and false otherwise (including if there was an error)
 	 */
 	public static boolean isAdmin(int userId) {
-		User u = Users.get(userId);
-		return u != null && u.getRole().equals(R.ADMIN_ROLE_NAME);
+		CacheEntry<Boolean> entry = isAdminCache.get(userId);
+		if (entry != null && !entry.isExpired(CACHE_DURATION_MS)) {
+			return entry.value;
+		}
+
+		Connection con = null;
+		try {
+			con = Common.getConnection();
+			boolean isAdmin = isAdmin(con, userId);
+			isAdminCache.put(userId, new CacheEntry<>(isAdmin));
+			return isAdmin;
+		} catch (Exception e) {
+			log.error(e.getMessage(), e);
+		} finally {
+			Common.safeClose(con);
+		}
+		return false;
 	}
 
 	public static boolean isAdmin(Connection con, int userId) {
+		CacheEntry<Boolean> entry = isAdminCache.get(userId);
+		if (entry != null && !entry.isExpired(CACHE_DURATION_MS)) {
+			return entry.value;
+		}
+
 		User u = Users.get(con, userId);
-		return u != null && u.getRole().equals(R.ADMIN_ROLE_NAME);
+		boolean isAdmin = u != null && u.getRole().equals(R.ADMIN_ROLE_NAME);
+		if (entry == null || entry.value != isAdmin) {
+			log.info("Checking isAdmin for userId=" + userId + ", result=" + isAdmin);
+		}
+		isAdminCache.put(userId, new CacheEntry<>(isAdmin));
+		return isAdmin;
+	}
+
+	/**
+	 * Invalidates the isAdmin cache for a specific user.
+	 * Should be called whenever a user's role changes or user is deleted.
+	 *
+	 * @param userId The user ID whose cache entry should be invalidated
+	 */
+	public static void invalidateIsAdminCache(int userId) {
+		isAdminCache.remove(userId);
+		log.debug("Invalidated isAdmin cache for userId=" + userId);
 	}
 
 	/**
@@ -1343,6 +1596,9 @@ public class Users {
 			procedure.setInt(1, userId);
 			procedure.setString(2, role);
 			procedure.executeUpdate();
+			
+			// Invalidate cache after role change
+			invalidateIsAdminCache(userId);
 
 			return true;
 		} catch (Exception e) {
